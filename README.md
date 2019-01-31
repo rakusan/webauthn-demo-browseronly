@@ -1,5 +1,7 @@
 # webauthn-demo-browseronly
 
+Demo: https://rakusan.github.io/webauthn-demo-browseronly/
+
 * WebAuthnの雑なデモです。
 * RP側の処理も全部ブラウザ内でやってます。
   * WebAuthnの一連の流れを全部ブラウザ側で確認できるものを作ろう、という目的のものです。
