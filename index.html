@@ -1,0 +1,139 @@
+<!DOCTYPE html>
+<html>
+<head>
+</head>
+<body>
+<iframe src="rp.html" id="rp" style="display:none;"></iframe>
+
+<div>
+[Register]
+<form name="register">
+    <label for="registerLoginId">Login ID: </label>
+    <input type="text" name="loginId" id="registerLoginId">
+    <br>
+    <label for="registerName">Name: </label>
+    <input type="text" name="name" id="registerName">
+    <br>
+    <input type="submit" value="Register">
+</form>
+</div>
+
+<br>
+
+<div>
+[Login]
+<form name="login">
+    <label for="loginId">Login ID: </label>
+    <input type="text" name="loginId" id="loginId">
+    <br>
+    <input type="submit" value="Login">
+</form>
+</div>
+
+<script>
+
+document.forms.register.addEventListener("submit", (event) => {
+    event.preventDefault();
+
+    let form = event.target;
+    let loginId = form.elements.loginId.value;
+    let name = form.elements.name.value;
+
+    if (loginId.length === 0) {
+        alert("Login ID is empty.");
+    } else if (name.length === 0) {
+        alert("Name is empty.");
+    } else {
+        register(loginId, name);
+    }
+}, false);
+
+document.forms.login.addEventListener("submit", (event) => {
+    event.preventDefault();
+
+    let form = event.target;
+    let loginId = form.elements.loginId.value;
+
+    if (loginId.length === 0) {
+        alert("Login ID is empty.");
+    } else {
+        login(loginId);
+    }
+}, false);
+
+
+let origin = document.location.origin;
+let rp = document.getElementById("rp").contentWindow;
+
+function waitMessage() {
+    return new Promise((resolve, reject) => {
+        let listener = (event) => {
+            window.removeEventListener("message", listener, false);
+            resolve(event.data);
+        };
+        window.addEventListener("message", listener, false);
+    });
+}
+
+async function register(loginId, name) {
+    let registerMessage = {
+        action: "register",
+        loginId: loginId,
+        name: name
+    };
+    rp.postMessage(registerMessage, origin);
+
+    let message = await waitMessage();
+    if (typeof(message) === "string") {
+        alert(message);
+        return;
+    }
+
+    let publicKeyCredential = await navigator.credentials.create({ publicKey: message });
+
+    let responseMessage = {
+        action: "registerResponse",
+        response: {
+            attestationObject: publicKeyCredential.response.attestationObject,
+            clientDataJSON: publicKeyCredential.response.clientDataJSON
+        }
+    };
+    rp.postMessage(responseMessage, origin);
+
+    message = await waitMessage();
+    alert(message);
+}
+
+async function login(loginId) {
+    let loginMessage = {
+        action: "login",
+        loginId: loginId
+    };
+    rp.postMessage(loginMessage, origin);
+
+    let message = await waitMessage();
+    if (typeof(message) === "string") {
+        alert(message);
+        return;
+    }
+
+    let publicKeyCredential = await navigator.credentials.get({ publicKey: message });
+
+    let responseMessage = {
+        action: "loginResponse",
+        response: {
+            authenticatorData: publicKeyCredential.response.authenticatorData,
+            clientDataJSON: publicKeyCredential.response.clientDataJSON,
+            signature: publicKeyCredential.response.signature,
+            userHandle: publicKeyCredential.response.userHandle
+        }
+    };
+    rp.postMessage(responseMessage, origin);
+
+    message = await waitMessage();
+    alert(message);
+}
+
+</script>
+</body>
+</html>

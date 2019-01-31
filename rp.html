@@ -1,0 +1,340 @@
+<!DOCTYPE html>
+<html>
+<head>
+<script src="base64js.min.js"></script>
+<script src="cbor.js"></script>
+</head>
+<body>
+<script>
+
+let client = window.parent;
+let origin = document.location.origin;
+
+let database = localStorage.database ? JSON.parse(localStorage.database) : {};
+let session = {};
+
+window.addEventListener("message", event => {
+    let data = event.data;
+    switch (data.action) {
+        case "register":
+            register(data.loginId, data.name);
+            break;
+
+        case "registerResponse":
+            registerResponse(data.response);
+            break;
+
+        case "login":
+            login(data.loginId);
+            break;
+
+        case "loginResponse":
+            loginResponse(data.response);
+            break;
+    }
+}, false);
+
+function loginIdExists(loginId) {
+    return database[loginId] && database[loginId].registered;
+}
+
+function newRandomUint8Array(length) {
+    let buffer = new Uint8Array(length);
+    window.crypto.getRandomValues(buffer);
+    return buffer;
+}
+
+function register(loginId, name) {
+    if (loginIdExists(loginId)) {
+        client.postMessage("Login ID already exists.", origin);
+        return;
+    }
+
+    let challengeBuffer = newRandomUint8Array(32);
+    let idBuffer = newRandomUint8Array(16);
+
+    let response = {
+        challenge: challengeBuffer,
+        rp: {
+            name: "WebAuthn Example"
+        },
+        user: {
+            id: idBuffer,
+            name: loginId,
+            displayName: name
+        },
+        pubKeyCredParams: [
+            { type: 'public-key',  alg: -7  }, // ES256
+            //{ type: 'public-key', alg: -257 }  // RS256
+        ]
+    };
+
+    database[loginId] = {
+        id: base64js.fromByteArray(idBuffer),
+        displayName: name,
+        registered: false
+    };
+    localStorage.database = JSON.stringify(database);
+
+    session.challenge = challengeBuffer;
+    session.loginId = loginId;
+
+    client.postMessage(response, origin);
+}
+
+function verifyClientDataJSON(clientDataJSON, type) {
+    let clientDataObj = JSON.parse(String.fromCharCode.apply(null, new Uint8Array(clientDataJSON)));
+
+    let challenge = clientDataObj.challenge.replace(/_/g, "/").replace(/-/g, "+");
+    while (challenge.length % 4 !== 0) {
+        challenge += "=";
+    }
+    if (challenge != base64js.fromByteArray(session.challenge)) {
+        return "Challenges don't match.";
+    }
+
+    if (clientDataObj.type != type) {
+        return "Types don't match.";
+    }
+
+    if (clientDataObj.origin != origin) {
+        return "Origins don't match.";
+    }
+
+    return null;
+}
+
+async function verifyAuthData(authData) {
+    let hostname = document.location.hostname;
+    let hostnameHash = await window.crypto.subtle.digest("SHA-256", (new TextEncoder("utf-8")).encode(hostname));
+    let hostnameHashStr = base64js.fromByteArray(new Uint8Array(hostnameHash));
+    let rpIdHashStr = base64js.fromByteArray(authData.subarray(0, 32));
+    if (rpIdHashStr != hostnameHashStr) {
+        return "rpIdHash don't match.";
+    }
+
+    let dataView = new DataView(authData.buffer, authData.byteOffset, authData.byteLength);
+    let flags = dataView.getUint8(32);
+    let signCount = dataView.getUint32(33);
+
+    let ed = !!((flags >> 7) & 1);
+    let at = !!((flags >> 6) & 1);
+    let uv = !!((flags >> 2) & 1);
+    let up = !!((flags >> 0) & 1);
+
+    console.log("flags", flags);
+    console.log("ed", ed);
+    console.log("at", at);
+    console.log("uv", uv);
+    console.log("up", up);
+    console.log("signCount", signCount);
+
+    if (ed || !up) {
+        return "Invalid flags.";
+    }
+
+    if (at) {
+        //let aaguid = authData.subarray(37, 37+16);
+        let credentialIdLength = dataView.getUint16(53);
+        let credentialId = authData.subarray(55, 55+credentialIdLength);
+        let credentialPublicKey = authData.slice(55+credentialIdLength);
+
+        let coseKey = CBOR.decode(credentialPublicKey.buffer);
+        console.log("coseKey", coseKey);
+
+        let keyType = coseKey["1"];
+        let alg = coseKey["3"];
+        let crv = coseKey["-1"];
+        let x = coseKey["-2"];
+        let y = coseKey["-3"];
+    
+        if (keyType !== 2 || crv !== 1) {
+            return "Invalid keyType or crv.";
+        }
+
+        let pubkey = await window.crypto.subtle.importKey(
+            "jwk",
+            {
+                "kty": "EC",
+                "crv": "P-256",
+                "x": base64js.fromByteArray(x).replace(/\//g, "_").replace(/\+/g, "-").replace(/=/g, ""),
+                "y": base64js.fromByteArray(y).replace(/\//g, "_").replace(/\+/g, "-").replace(/=/g, ""),
+                "ext": true
+            },
+            {
+                name: "ECDSA",
+                namedCurve: "P-256",
+            },
+            true,
+            [ "verify" ]
+        );
+
+        let publicKeyJWK = await window.crypto.subtle.exportKey("jwk", pubkey);
+
+        return { credentialId, publicKeyJWK, signCount };
+
+    } else {
+        return { signCount };
+    }
+}
+
+async function registerResponse(response) {
+    let loginId = session.loginId;
+    if (loginIdExists(loginId)) {
+        client.postMessage("Login ID already exists.", origin);
+        return;
+    }
+
+    let errorMessage = verifyClientDataJSON(response.clientDataJSON, "webauthn.create");
+    if (errorMessage) {
+        client.postMessage(errorMessage, origin);
+        return;
+    }
+
+    let attestationObj = CBOR.decode(response.attestationObject);
+    let rawAuthData = attestationObj.authData;
+
+    let authData = await verifyAuthData(rawAuthData);
+    if (typeof(authData) === "string") {
+        client.postMessage(authData, origin);
+        return;
+    }
+
+    database[loginId].registered = true;
+    database[loginId].credentialId = base64js.fromByteArray(authData.credentialId);
+    database[loginId].publicKeyJWK = authData.publicKeyJWK;
+    database[loginId].signCount = authData.signCount;
+    localStorage.database = JSON.stringify(database);
+
+    client.postMessage("Successfully registered!", origin);
+}
+
+function login(loginId) {
+    if (!database[loginId] || !database[loginId].registered) {
+        client.postMessage("Login ID doesn't exist.", origin);
+        return;
+    }
+
+    let challengeBuffer = new Uint8Array(32);
+    window.crypto.getRandomValues(challengeBuffer);
+
+    let response = {
+        challenge: challengeBuffer,
+        allowCredentials: [ { type: "public-key", id: base64js.toByteArray(database[loginId].credentialId) } ]
+    };
+
+    session.challenge = challengeBuffer;
+    session.loginId = loginId;
+
+    client.postMessage(response, origin);
+}
+
+async function loginResponse(response) {
+    let loginId = session.loginId;
+    if (!loginIdExists(loginId)) {
+        client.postMessage("Login ID doesn't exist.", origin);
+        return;
+    }
+
+    let errorMessage = verifyClientDataJSON(response.clientDataJSON, "webauthn.get");
+    if (errorMessage) {
+        client.postMessage(errorMessage, origin);
+        return;
+    }
+
+    let rawAuthData = new Uint8Array(response.authenticatorData);
+
+    let authData = await verifyAuthData(rawAuthData);
+    if (typeof(authData) === "string") {
+        client.postMessage(authData, origin);
+        return;
+    }
+
+    let clientDataJSONHash = await window.crypto.subtle.digest("SHA-256", response.clientDataJSON);
+
+    let data = new Uint8Array(response.authenticatorData.byteLength + clientDataJSONHash.byteLength);
+    data.set(new Uint8Array(response.authenticatorData));
+    data.set(new Uint8Array(clientDataJSONHash), response.authenticatorData.byteLength);
+
+    let pubkey = await window.crypto.subtle.importKey(
+        "jwk",
+        database[loginId].publicKeyJWK,
+        {
+            name: "ECDSA",
+            namedCurve: "P-256",
+        },
+        true,
+        [ "verify" ]
+    );
+
+    let isValid = await window.crypto.subtle.verify(
+                    { name: "ECDSA", hash: { name: "SHA-256" } },
+                    pubkey,
+                    ecdsaSignatureDerToRaw(response.signature).buffer,
+                    data.buffer);
+
+    client.postMessage(isValid ? `${database[loginId].displayName} successfully logged in.` : "Login failed", origin);
+}
+
+function derRead(der, offset, type) {
+    let i = offset;
+    if (der[i++] !== type) {
+        throw "type is not " + type;
+    }
+    let len = der[i++];
+    return [ der.subarray(i, i+len), i+len ];
+}
+
+function derReadSequence(der, offset) {
+    return derRead(der, offset, 0x30);
+}
+
+function derReadInteger(der, offset) {
+    return derRead(der, offset, 0x02);
+}
+
+function removePrefixZero(value) {
+    let i = 0;
+    while (value[i] === 0) {
+        ++i;
+    }
+    return (i === 0) ? value : value.subarray(i);
+}
+
+function insertPrefixZero(value, count) {
+    if (count > 0) {
+        let newValue = new Uint8Array(value.length + count);
+        newValue.set(value, count);
+        return newValue;
+    }
+    return value;
+}
+
+function ecdsaSignatureDerToRaw(derSig) {
+    if (derSig instanceof ArrayBuffer) {
+        derSig = new Uint8Array(derSig);
+    }
+    if (!(derSig instanceof Uint8Array)) {
+        throw "Argument is niether Uint8Array nor ArrayBuffer";
+    }
+
+    let seq, i;
+    [ seq, i ] = derReadSequence(derSig, 0);
+
+    let r, s;
+    [ r, i ] = derReadInteger(seq, 0);
+    [ s, i ] = derReadInteger(seq, i);
+    r = removePrefixZero(r);
+    s = removePrefixZero(s);
+    r = insertPrefixZero(r, s.length - r.length);
+    s = insertPrefixZero(s, r.length - s.length);
+
+    let raw = new Uint8Array(r.length + s.length);
+    raw.set(r);
+    raw.set(s, r.length);
+    return raw;
+}
+
+</script>
+</body>
+</html>
